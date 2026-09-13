@@ -1,0 +1,472 @@
+// server.js
+// Single-file Telegram mini-app prototype: ad rewards + referral rule A + admin panel
+// Usage:
+// 1) npm install express better-sqlite3 uuid bcrypt jsonwebtoken helmet body-parser cors
+// 2) node server.js
+//
+// Optional env:
+// ADMIN_PIN_HASH - bcrypt hash of admin PIN (default hash for "Garba" is baked in)
+// ADMIN_JWT_SECRET - JWT secret for admin tokens
+// PORT - port to listen on (default 3000)
+
+const express = require('express');
+const Database = require('better-sqlite3');
+const { v4: uuidv4 } = require('uuid');
+const bcrypt = require('bcrypt');
+const jwt = require('jsonwebtoken');
+const helmet = require('helmet');
+const bodyParser = require('body-parser');
+const cors = require('cors');
+
+const PORT = process.env.PORT || 3000;
+// default bcrypt hash for "Garba" (change in production)
+const ADMIN_PIN_HASH = process.env.ADMIN_PIN_HASH || '$2b$10$XwS1Jq1ILf0ZzZ6RjQJq9eYcZ6Gq0sC7xgV9pQdJ4Yb8I1GgWzvS6';
+const ADMIN_JWT_SECRET = process.env.ADMIN_JWT_SECRET || 'change_this_secret';
+
+const DB_FILE = process.env.DB_FILE || 'app.db';
+const db = new Database(DB_FILE);
+db.pragma('foreign_keys = ON');
+
+function initDb() {
+  db.exec(`
+    PRAGMA foreign_keys = ON;
+    CREATE TABLE IF NOT EXISTS users (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      username TEXT UNIQUE,
+      telegram_id TEXT,
+      invite_code TEXT UNIQUE,
+      referrer_id INTEGER,
+      balance INTEGER DEFAULT 0,
+      created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+      FOREIGN KEY(referrer_id) REFERENCES users(id)
+    );
+
+    CREATE TABLE IF NOT EXISTS ad_tokens (
+      token TEXT PRIMARY KEY,
+      user_id INTEGER NOT NULL,
+      used INTEGER DEFAULT 0,
+      expires_at INTEGER,
+      created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+      FOREIGN KEY(user_id) REFERENCES users(id)
+    );
+
+    CREATE TABLE IF NOT EXISTS ad_events (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      user_id INTEGER NOT NULL,
+      amount INTEGER NOT NULL,
+      created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+      FOREIGN KEY(user_id) REFERENCES users(id)
+    );
+
+    CREATE TABLE IF NOT EXISTS withdrawals (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      user_id INTEGER NOT NULL,
+      amount INTEGER NOT NULL,
+      details TEXT,
+      status TEXT DEFAULT 'pending',
+      created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+      FOREIGN KEY(user_id) REFERENCES users(id)
+    );
+  `);
+}
+initDb();
+
+const app = express();
+app.use(helmet());
+app.use(cors());
+app.use(bodyParser.json());
+
+// Embedded frontend pages and JS
+const INDEX_HTML = `<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <title>Watch Ads — Earn</title>
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <style>
+    body { font-family: Arial, sans-serif; padding: 16px; max-width:700px; margin:auto }
+    .card { border: 1px solid #ddd; padding: 12px; margin-bottom: 12px; border-radius: 6px; }
+    button { padding: 8px 12px; margin-top:6px }
+    input { margin: 6px 0; padding: 6px; width: 100%; box-sizing: border-box; }
+    pre { white-space: pre-wrap; }
+  </style>
+</head>
+<body>
+  <h2>Watch Ads — Earn</h2>
+
+  <div id="registerDiv" class="card">
+    <h3>Register</h3>
+    <input id="username" placeholder="username" />
+    <input id="invite" placeholder="invite code (optional)" />
+    <button id="btnRegister">Register</button>
+    <div id="regOut"></div>
+  </div>
+
+  <div id="userDiv" class="card" style="display:none;">
+    <h3>Account</h3>
+    <pre id="info"></pre>
+    <button id="btnGetToken">Start Ad (create token)</button>
+    <button id="btnSimAdFinish" disabled>Simulate Ad Finish (redeem token)</button>
+    <div id="adOut"></div>
+
+    <h4>Withdraw</h4>
+    <input id="withdrawAmount" type="number" placeholder="amount (Naira)" />
+    <input id="withdrawDetails" placeholder="account details (e.g. bank acct)" />
+    <button id="btnWithdraw">Request Withdrawal</button>
+    <div id="wdOut"></div>
+  </div>
+
+  <p><a href="/admin.html" target="_blank">Admin panel</a></p>
+  <script src="/app.js"></script>
+</body>
+</html>`;
+
+const APP_JS = `// client-side JS for single-file app
+let currentUser = null;
+let lastToken = null;
+
+document.addEventListener('DOMContentLoaded', () => {
+  const btnReg = document.getElementById('btnRegister');
+  if (btnReg) btnReg.addEventListener('click', register);
+  const btnGetToken = document.getElementById('btnGetToken');
+  if (btnGetToken) btnGetToken.addEventListener('click', createToken);
+  const btnSim = document.getElementById('btnSimAdFinish');
+  if (btnSim) btnSim.addEventListener('click', redeemToken);
+  const btnWithdraw = document.getElementById('btnWithdraw');
+  if (btnWithdraw) btnWithdraw.addEventListener('click', requestWithdraw);
+});
+
+async function register() {
+  const username = document.getElementById('username').value.trim();
+  const invite = document.getElementById('invite').value.trim();
+  if (!username) return alert('enter username');
+  const res = await fetch('/api/register', { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({ username, invite_code: invite || undefined }) });
+  const j = await res.json();
+  if (!res.ok) return alert(JSON.stringify(j));
+  currentUser = j.user;
+  document.getElementById('regOut').innerText = 'Registered. Invite link: ' + j.inviteLink;
+  showUser();
+}
+
+function showUser() {
+  if (!currentUser) return;
+  document.getElementById('registerDiv').style.display = 'none';
+  document.getElementById('userDiv').style.display = 'block';
+  document.getElementById('info').innerText = 'ID: ' + currentUser.id + '\\nUsername: ' + currentUser.username + '\\nBalance: ' + currentUser.balance + ' Naira\\nInvite code: ' + currentUser.invite_code;
+}
+
+async function createToken() {
+  if (!currentUser) return alert('register first');
+  const res = await fetch('/api/create_ad_token', { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({ user_id: currentUser.id }) });
+  const j = await res.json();
+  if (!res.ok) return alert(JSON.stringify(j));
+  lastToken = j.token;
+  document.getElementById('adOut').innerText = 'Token created (valid 120s). Token: ' + lastToken;
+  document.getElementById('btnSimAdFinish').disabled = false;
+  // Integrate real ad SDK here; pass token to SDK and only call redeem after provider confirms ad finished.
+}
+
+async function redeemToken() {
+  if (!currentUser || !lastToken) return alert('no token');
+  const res = await fetch('/api/redeem_ad_token', { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({ user_id: currentUser.id, token: lastToken }) });
+  const j = await res.json();
+  if (!res.ok) return alert(JSON.stringify(j));
+  document.getElementById('adOut').innerText = 'Ad credited: ' + j.credited + ' Naira. New balance: ' + j.balance;
+  currentUser.balance = j.balance;
+  showUser();
+  lastToken = null;
+  document.getElementById('btnSimAdFinish').disabled = true;
+}
+
+async function requestWithdraw() {
+  if (!currentUser) return alert('register first');
+  const amount = parseInt(document.getElementById('withdrawAmount').value, 10);
+  const details = document.getElementById('withdrawDetails').value.trim();
+  if (!amount || !details) return alert('amount and details required');
+  const res = await fetch('/api/request_withdrawal', { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({ user_id: currentUser.id, amount, details }) });
+  const j = await res.json();
+  if (!res.ok) return alert(JSON.stringify(j));
+  document.getElementById('wdOut').innerText = j.message || 'withdrawal requested';
+  currentUser.balance -= amount;
+  showUser();
+}
+`;
+
+const ADMIN_HTML = `<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <title>Admin Panel</title>
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <style>
+    body { font-family: Arial, sans-serif; padding: 16px; max-width:900px; margin:auto}
+    .card { border: 1px solid #ddd; padding: 12px; margin-bottom: 12px; border-radius: 6px; }
+    button { padding: 6px 10px; margin:4px }
+    input { padding: 6px; width: 200px; }
+    pre { white-space: pre-wrap; }
+  </style>
+</head>
+<body>
+  <h2>Admin Panel</h2>
+
+  <div id="loginDiv" class="card">
+    <h3>Login (PIN)</h3>
+    <input id="pin" placeholder="admin pin" />
+    <button id="btnLogin">Login</button>
+    <div id="loginOut"></div>
+  </div>
+
+  <div id="panel" style="display:none;">
+    <button id="btnRefresh">Refresh</button>
+    <h3>Withdrawals</h3>
+    <div id="wdList"></div>
+
+    <h3>Users</h3>
+    <div id="userList"></div>
+  </div>
+
+<script>
+let token = null;
+document.getElementById('btnLogin').addEventListener('click', async () => {
+  const pin = document.getElementById('pin').value;
+  const res = await fetch('/api/admin/login', { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({ pin }) });
+  const j = await res.json();
+  if (!res.ok) return document.getElementById('loginOut').innerText = JSON.stringify(j);
+  token = j.token;
+  document.getElementById('loginDiv').style.display = 'none';
+  document.getElementById('panel').style.display = 'block';
+  loadData();
+});
+
+document.getElementById('btnRefresh').addEventListener('click', loadData);
+
+async function loadData() {
+  const hdr = { Authorization: 'Bearer ' + token };
+  const r1 = await fetch('/api/admin/withdrawals', { headers: hdr });
+  const j1 = await r1.json();
+  if (!r1.ok) return alert(JSON.stringify(j1));
+  const wdList = document.getElementById('wdList');
+  wdList.innerHTML = '';
+  j1.withdrawals.forEach(w => {
+    const div = document.createElement('div');
+    div.className = 'card';
+    div.innerHTML = '<b>ID:</b> ' + w.id + ' <b>User:</b> ' + w.username + ' (' + w.user_id + ') <b>Amount:</b> ' + w.amount + ' <b>Status:</b> ' + w.status + '<br/><b>Details:</b> ' + (w.details||'') + '<br/><button onclick="approve('+w.id+')">Approve (mark paid)</button> <button onclick="reject('+w.id+')">Reject</button>';
+    wdList.appendChild(div);
+  });
+
+  const r2 = await fetch('/api/admin/users', { headers: hdr });
+  const j2 = await r2.json();
+  if (!r2.ok) return alert(JSON.stringify(j2));
+  const userList = document.getElementById('userList');
+  userList.innerHTML = '';
+  j2.users.forEach(u => {
+    const d = document.createElement('div');
+    d.className = 'card';
+    d.innerHTML = '<b>' + u.username + '</b> (ID ' + u.id + ') <br/>Balance: ' + u.balance + ' Naira <br/>Invite: ' + u.invite_code + ' <br/>Referrer ID: ' + (u.referrer_id||'None');
+    userList.appendChild(d);
+  });
+}
+
+window.approve = async (id) => {
+  if (!confirm('Mark withdrawal as paid?')) return;
+  const res = await fetch('/api/admin/withdrawals/' + id + '/approve', { method:'POST', headers: { Authorization: 'Bearer ' + token } });
+  const j = await res.json();
+  if (!res.ok) return alert(JSON.stringify(j));
+  loadData();
+};
+
+window.reject = async (id) => {
+  if (!confirm('Reject withdrawal and refund user?')) return;
+  const res = await fetch('/api/admin/withdrawals/' + id + '/reject', { method:'POST', headers: { Authorization: 'Bearer ' + token } });
+  const j = await res.json();
+  if (!res.ok) return alert(JSON.stringify(j));
+  loadData();
+};
+</script>
+</body>
+</html>`;
+
+// routes to serve embedded frontend
+app.get('/', (req, res) => res.type('html').send(INDEX_HTML));
+app.get('/app.js', (req, res) => res.type('application/javascript').send(APP_JS));
+app.get('/admin.html', (req, res) => res.type('html').send(ADMIN_HTML));
+
+function generateInviteCode() { return uuidv4().split('-')[0]; }
+
+// API endpoints
+app.post('/api/register', (req, res) => {
+  const { username, invite_code } = req.body || {};
+  if (!username) return res.status(400).json({ error: 'username required' });
+  const newInvite = generateInviteCode();
+  const insert = db.prepare('INSERT INTO users (username, invite_code) VALUES (?, ?)');
+  try {
+    const info = insert.run(username, newInvite);
+    const userId = info.lastInsertRowid;
+
+    if (invite_code) {
+      const ref = db.prepare('SELECT id FROM users WHERE invite_code = ?').get(invite_code);
+      if (ref) {
+        const refId = ref.id;
+        db.prepare('UPDATE users SET referrer_id = ? WHERE id = ?').run(refId, userId);
+        db.prepare('UPDATE users SET balance = balance + ? WHERE id = ?').run(10, refId);
+      }
+    }
+
+    const user = db.prepare('SELECT id, username, invite_code, referrer_id, balance FROM users WHERE id = ?').get(userId);
+    const inviteLink = \`\${req.protocol}://\${req.get('host')}/?invite=\${user.invite_code}\`;
+    res.json({ user, inviteLink });
+  } catch (e) {
+    if (e && e.message && e.message.includes('UNIQUE')) return res.status(400).json({ error: 'username already taken' });
+    console.error(e);
+    res.status(500).json({ error: 'server error' });
+  }
+});
+
+app.get('/api/user/:id', (req, res) => {
+  const id = req.params.id;
+  const user = db.prepare('SELECT id, username, invite_code, referrer_id, balance FROM users WHERE id = ?').get(id);
+  if (!user) return res.status(404).json({ error: 'not found' });
+  res.json({ user });
+});
+
+app.post('/api/create_ad_token', (req, res) => {
+  const { user_id } = req.body || {};
+  if (!user_id) return res.status(400).json({ error: 'user_id required' });
+  const user = db.prepare('SELECT id FROM users WHERE id = ?').get(user_id);
+  if (!user) return res.status(404).json({ error: 'user not found' });
+  const token = uuidv4();
+  const expiresAt = Math.floor(Date.now() / 1000) + 120; // 2 minutes
+  db.prepare('INSERT INTO ad_tokens (token, user_id, expires_at, used) VALUES (?, ?, ?, 0)').run(token, user_id, expiresAt);
+  res.json({ token, expires_at: expiresAt });
+});
+
+app.post('/api/redeem_ad_token', (req, res) => {
+  const { user_id, token } = req.body || {};
+  if (!user_id || !token) return res.status(400).json({ error: 'user_id and token required' });
+
+  const row = db.prepare('SELECT token, user_id, used, expires_at FROM ad_tokens WHERE token = ?').get(token);
+  if (!row) return res.status(400).json({ error: 'invalid token' });
+  if (row.used) return res.status(400).json({ error: 'token already used' });
+  if (row.user_id !== user_id) return res.status(400).json({ error: 'token does not belong to user' });
+  const now = Math.floor(Date.now() / 1000);
+  if (row.expires_at < now) return res.status(400).json({ error: 'token expired' });
+
+  const credit = 2; // 2 naira
+  const refShare = Math.floor(credit * 0.5); // 1 naira
+
+  const tx = db.transaction(() => {
+    db.prepare('UPDATE ad_tokens SET used = 1 WHERE token = ?').run(token);
+    db.prepare('UPDATE users SET balance = balance + ? WHERE id = ?').run(credit, user_id);
+    db.prepare('INSERT INTO ad_events (user_id, amount) VALUES (?, ?)').run(user_id, credit);
+    const user = db.prepare('SELECT referrer_id FROM users WHERE id = ?').get(user_id);
+    if (user && user.referrer_id) {
+      db.prepare('UPDATE users SET balance = balance + ? WHERE id = ?').run(refShare, user.referrer_id);
+    }
+  });
+
+  try {
+    tx();
+    const newBal = db.prepare('SELECT balance FROM users WHERE id = ?').get(user_id);
+    res.json({ success: true, credited: credit, balance: newBal.balance });
+  } catch (e) {
+    console.error(e);
+    res.status(500).json({ error: 'server error' });
+  }
+});
+
+app.post('/api/request_withdrawal', (req, res) => {
+  const { user_id, amount, details } = req.body || {};
+  if (!user_id || !amount || !details) return res.status(400).json({ error: 'user_id, amount, details required' });
+  const minWithdrawal = 500;
+  if (amount < minWithdrawal) return res.status(400).json({ error: \`minimum withdrawal is \${minWithdrawal} naira\` });
+  const user = db.prepare('SELECT balance FROM users WHERE id = ?').get(user_id);
+  if (!user) return res.status(404).json({ error: 'user not found' });
+  if (user.balance < amount) return res.status(400).json({ error: 'insufficient balance' });
+
+  const tx = db.transaction(() => {
+    db.prepare('UPDATE users SET balance = balance - ? WHERE id = ?').run(amount, user_id);
+    db.prepare('INSERT INTO withdrawals (user_id, amount, details, status) VALUES (?, ?, ?, ?)').run(user_id, amount, details, 'pending');
+  });
+
+  try {
+    tx();
+    res.json({ success: true, message: 'withdrawal requested and is pending admin approval' });
+  } catch (e) {
+    console.error(e);
+    res.status(500).json({ error: 'server error' });
+  }
+});
+
+// Admin
+app.post('/api/admin/login', async (req, res) => {
+  const { pin } = req.body || {};
+  if (!pin) return res.status(400).json({ error: 'pin required' });
+  const match = await bcrypt.compare(pin, ADMIN_PIN_HASH);
+  if (!match) return res.status(401).json({ error: 'invalid pin' });
+  const token = jwt.sign({ admin: true }, ADMIN_JWT_SECRET, { expiresIn: '12h' });
+  res.json({ token });
+});
+
+function verifyAdmin(req, res, next) {
+  const auth = req.headers.authorization;
+  if (!auth) return res.status(401).json({ error: 'missing authorization' });
+  const parts = auth.split(' ');
+  if (parts.length !== 2) return res.status(401).json({ error: 'invalid authorization' });
+  const token = parts[1];
+  try {
+    const payload = jwt.verify(token, ADMIN_JWT_SECRET);
+    if (payload && payload.admin) return next();
+    return res.status(403).json({ error: 'forbidden' });
+  } catch (e) {
+    return res.status(401).json({ error: 'invalid token' });
+  }
+}
+
+app.get('/api/admin/withdrawals', verifyAdmin, (req, res) => {
+  const rows = db.prepare(\`
+    SELECT w.id, w.user_id, u.username, w.amount, w.details, w.status, w.created_at
+    FROM withdrawals w
+    LEFT JOIN users u ON u.id = w.user_id
+    ORDER BY w.created_at DESC
+  \`).all();
+  res.json({ withdrawals: rows });
+});
+
+app.post('/api/admin/withdrawals/:id/approve', verifyAdmin, (req, res) => {
+  const id = req.params.id;
+  const w = db.prepare('SELECT * FROM withdrawals WHERE id = ?').get(id);
+  if (!w) return res.status(404).json({ error: 'not found' });
+  if (w.status !== 'pending') return res.status(400).json({ error: 'can only approve pending withdrawals' });
+  db.prepare('UPDATE withdrawals SET status = ? WHERE id = ?').run('paid', id);
+  res.json({ success: true });
+});
+
+app.post('/api/admin/withdrawals/:id/reject', verifyAdmin, (req, res) => {
+  const id = req.params.id;
+  const w = db.prepare('SELECT * FROM withdrawals WHERE id = ?').get(id);
+  if (!w) return res.status(404).json({ error: 'not found' });
+  if (w.status !== 'pending') return res.status(400).json({ error: 'can only reject pending withdrawals' });
+
+  const tx = db.transaction(() => {
+    db.prepare('UPDATE withdrawals SET status = ? WHERE id = ?').run('rejected', id);
+    db.prepare('UPDATE users SET balance = balance + ? WHERE id = ?').run(w.amount, w.user_id);
+  });
+
+  try {
+    tx();
+    res.json({ success: true });
+  } catch (e) {
+    console.error(e);
+    res.status(500).json({ error: 'server error' });
+  }
+});
+
+app.get('/api/admin/users', verifyAdmin, (req, res) => {
+  const rows = db.prepare('SELECT id, username, invite_code, referrer_id, balance, created_at FROM users ORDER BY created_at DESC').all();
+  res.json({ users: rows });
+});
+
+app.listen(PORT, () => {
+  console.log('Server running on port', PORT);
+  console.log('Open http://localhost:' + PORT + '/');
+});
